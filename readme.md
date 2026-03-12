@@ -1,12 +1,12 @@
-# Simple OCR (Linux)
+# Gnome Paddle
 
 A lightweight, native-feeling Linux desktop application for quick OCR using PaddleOCR.
 
-Built using the [ppu-paddle-ocr](https://github.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr) library, this project leverages the power of PaddleOCR for accurate text recognition while providing blazingly fast and seamless user experience on Linux desktops.
+Built using the [ppu-paddle-ocr](https://github.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr) library, this project leverages the power of PaddleOCR for accurate text recognition while providing a blazingly fast and seamless user experience on Linux desktops.
 
 ## Prerequisites
 
-Before installing, ensure you have the following system dependencies:
+Before installing, ensure you have the following system dependencies. The setup command will check for these and guide you if any are missing.
 
 ### 1. Bun
 ```bash
@@ -37,19 +37,22 @@ sudo pacman -S python-gobject gtk4 libadwaita libportal libportal-gtk4
    cd gnome-paddle
    ```
 
-2. **Run the setup script:**
-   This will create a Python virtual environment and install the Bun dependencies.
+2. **Run the setup command:**
+   This will create a Python virtual environment and install all dependencies.
    ```bash
-   chmod +x setup.sh
-   ./setup.sh
+   make setup
    ```
 
 ## Usage
 
-Run the application using the provided launcher:
+You can run the application using the `make` command (recommended):
+```bash
+make run
+```
+Alternatively, you can use the `run.sh` script:
 ```bash
 ./run.sh
 ```
 
 ## License
-MIT. See [LICENSE](LICENSE) for details.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

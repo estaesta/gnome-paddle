@@ -1,25 +1,16 @@
-#!/usr/bin/env python3
-"""
-Simple OCR Desktop App
-GTK4 + Libadwaita + PaddleOCR (via Bun sidecar)
-Uses libportal (Xdp) for screenshots — same as Frog.
-"""
-
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Xdp", "1.0")
 
-import json
 import subprocess
 import threading
 import time
-import signal
 import sys
 import os
-import urllib.request
-import urllib.error
-import tempfile
+import signal
+import requests
+from typing import Optional, List, Dict, Callable
 
 from gi.repository import Gtk, Adw, Gdk, Gio, GLib, Xdp
 
@@ -37,17 +28,17 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 class OcrServerManager:
     """Manages the lifecycle of the Bun OCR server."""
 
-    def __init__(self):
-        self.process = None
+    def __init__(self) -> None:
+        self.process: Optional[subprocess.Popen] = None
 
-    def _get_server_command(self):
+    def _get_server_command(self) -> List[str]:
         compiled_bin = os.environ.get("OCR_SERVER_BIN")
         if compiled_bin and os.path.isfile(compiled_bin):
             return [compiled_bin]
         else:
             return ["bun", "run", os.path.join(APP_DIR, "ocr_server.ts")]
 
-    def start(self):
+    def start(self) -> bool:
         if self.is_running():
             return True
 
@@ -59,52 +50,64 @@ class OcrServerManager:
                 stderr=subprocess.STDOUT,
                 cwd=APP_DIR,
             )
-            for _ in range(120):
+            # Wait for server to be ready
+            for _ in range(120):  # 2-minute timeout
                 time.sleep(1)
-                if self.is_running():
-                    try:
-                        req = urllib.request.Request(f"{OCR_SERVER_URL}/health")
-                        with urllib.request.urlopen(req, timeout=2) as resp:
-                            data = json.loads(resp.read())
-                            if data.get("status") == "ok":
-                                return True
-                    except Exception:
-                        pass
+                if not self.is_running():
+                    break  # Process died
+                try:
+                    resp = requests.get(f"{OCR_SERVER_URL}/health", timeout=1)
+                    resp.raise_for_status()
+                    if resp.json().get("status") == "ok":
+                        print("✅ OCR server started successfully.")
+                        return True
+                except requests.RequestException:
+                    continue  # Retry until timeout
+            print("❌ Timed out waiting for OCR server to start.")
             return False
         except FileNotFoundError:
-            print(f"ERROR: Could not find: {cmd[0]}")
+            print(f"❌ Command not found: '{cmd[0]}'. Is Bun installed and in your PATH?")
+            return False
+        except Exception as e:
+            print(f"❌ Failed to start OCR server: {e}")
             return False
 
-    def is_running(self):
+    def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
-    def stop(self):
+    def stop(self) -> None:
         if self.process and self.is_running():
+            print("Stopping OCR server...")
             try:
-                req = urllib.request.Request(
-                    f"{OCR_SERVER_URL}/shutdown", method="POST", data=b""
-                )
-                urllib.request.urlopen(req, timeout=3)
-            except Exception:
-                pass
+                requests.post(f"{OCR_SERVER_URL}/shutdown", timeout=2)
+            except requests.RequestException:
+                pass  # Server might already be down
             try:
                 self.process.terminate()
                 self.process.wait(timeout=5)
-            except Exception:
+            except Exception as e:
                 self.process.kill()
+                print(f"Forced to kill OCR server: {e}")
+            print("✅ OCR server stopped.")
 
-    def send_image(self, image_path: str) -> dict:
-        with open(image_path, "rb") as f:
-            image_data = f.read()
+    def send_image(self, image_path: str) -> Dict:
+        try:
+            with open(image_path, "rb") as f:
+                image_data = f.read()
 
-        req = urllib.request.Request(
-            f"{OCR_SERVER_URL}/ocr",
-            method="POST",
-            data=image_data,
-            headers={"Content-Type": "application/octet-stream"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read())
+            response = requests.post(
+                f"{OCR_SERVER_URL}/ocr",
+                data=image_data,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=30,
+            )
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as e:
+            return {
+                "status": "error",
+                "message": f"Network error: {e}",
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -117,37 +120,37 @@ class ScreenshotService:
     The screenshot is a temp file — not saved to ~/Pictures.
     """
 
-    def __init__(self):
-        self.portal = Xdp.Portal()
-        self._callback = None
+    def __init__(self) -> None:
+        self.portal: Xdp.Portal = Xdp.Portal()
+        self._callback: Optional[Callable[[Optional[str], Optional[str]], None]] = None
 
-    def capture(self, callback):
+    def capture(self, callback: Callable[[Optional[str], Optional[str]], None]) -> None:
         """
         Trigger interactive screenshot (region selection).
-        callback(filepath: str | None, error: str | None)
+        The callback will be invoked with (filepath, error).
         """
         self._callback = callback
         self.portal.take_screenshot(
-            None,                             # parent window
+            None,  # parent window
             Xdp.ScreenshotFlags.INTERACTIVE,  # let user select region
-            None,                             # cancellable
-            self._on_screenshot_finish,       # callback
-            None,                             # user_data
+            None,  # cancellable
+            self._on_screenshot_finish,  # callback
+            None,  # user_data
         )
 
-    def _on_screenshot_finish(self, source_object, res, user_data):
+    def _on_screenshot_finish(self, source_object, res, user_data) -> None:
+        if not self._callback:
+            return
+
         try:
             uri = self.portal.take_screenshot_finish(res)
 
             if not uri:
-                GLib.idle_add(self._callback, None, "No screenshot URI returned")
+                GLib.idle_add(self._callback, None, "Screenshot cancelled or failed.")
                 return
 
             # Convert file:// URI to path
-            if uri.startswith("file://"):
-                filepath = GLib.Uri.unescape_string(uri[7:])
-            else:
-                filepath = uri
+            filepath = GLib.Uri.unescape_string(uri[7:]) if uri.startswith("file://") else uri
 
             if os.path.exists(filepath):
                 GLib.idle_add(self._callback, filepath, None)
@@ -156,33 +159,40 @@ class ScreenshotService:
 
         except GLib.Error as e:
             if e.code == Gio.IOErrorEnum.CANCELLED:
-                GLib.idle_add(self._callback, None, "Cancelled by user")
+                GLib.idle_add(self._callback, None, "Cancelled by user.")
             else:
-                GLib.idle_add(self._callback, None, f"Screenshot error: {e.message}")
+                GLib.idle_add(self._callback, None, f"Portal error: {e.message}")
         except Exception as e:
-            GLib.idle_add(self._callback, None, f"Screenshot error: {e}")
+            GLib.idle_add(self._callback, None, f"Unexpected error: {e}")
 
 
 # ---------------------------------------------------------------------------
 # Main Application Window
 # ---------------------------------------------------------------------------
 class OcrWindow(Adw.ApplicationWindow):
-    def __init__(self, app, server_manager):
-        super().__init__(application=app, title="OCR")
+    def __init__(self, app: "OcrApp", server_manager: OcrServerManager):
+        super().__init__(application=app, title="gnome-paddle")
         self.server_manager = server_manager
         self.screenshot_service = ScreenshotService()
         self.set_default_size(500, 400)
 
-        # --- Header Bar ---
-        header = Adw.HeaderBar()
+        self._init_ui()
 
+        # Start OCR server in background
+        threading.Thread(target=self._start_server, daemon=True).start()
+
+    # --------------------------------------------------------------------
+    # UI Initialization
+    # --------------------------------------------------------------------
+    def _init_ui(self) -> None:
+        """Create and arrange all widgets for the window."""
+        header = Adw.HeaderBar()
         self.copy_btn = Gtk.Button(icon_name="edit-copy-symbolic")
         self.copy_btn.set_tooltip_text("Copy text to clipboard")
         self.copy_btn.connect("clicked", self.on_copy_clicked)
         self.copy_btn.set_sensitive(False)
         header.pack_end(self.copy_btn)
 
-        # --- Main Layout ---
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         main_box.append(header)
 
@@ -195,13 +205,10 @@ class OcrWindow(Adw.ApplicationWindow):
             margin_bottom=16,
         )
 
-        # Status banner
         self.status_banner = Adw.Banner()
-        self.status_banner.set_title("Starting OCR engine...")
-        self.status_banner.set_revealed(True)
+        self._set_status("Starting OCR engine...", revealed=True)
         content.append(self.status_banner)
 
-        # Capture button
         self.capture_btn = Gtk.Button(label="📷  Capture & Recognize")
         self.capture_btn.add_css_class("suggested-action")
         self.capture_btn.add_css_class("pill")
@@ -209,141 +216,142 @@ class OcrWindow(Adw.ApplicationWindow):
         self.capture_btn.connect("clicked", self.on_capture_clicked)
         content.append(self.capture_btn)
 
-        # Spinner
-        self.spinner = Gtk.Spinner()
+        self.spinner = Gtk.Spinner(vexpand=False, halign=Gtk.Align.CENTER)
         content.append(self.spinner)
 
-        # Result text view
         scrolled = Gtk.ScrolledWindow(vexpand=True)
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         scrolled.add_css_class("card")
 
-        self.text_view = Gtk.TextView()
-        self.text_view.set_editable(False)
-        self.text_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
-        self.text_view.set_left_margin(12)
-        self.text_view.set_right_margin(12)
-        self.text_view.set_top_margin(12)
-        self.text_view.set_bottom_margin(12)
+        self.text_view = Gtk.TextView(
+            editable=False,
+            wrap_mode=Gtk.WrapMode.WORD_CHAR,
+            left_margin=12,
+            right_margin=12,
+            top_margin=12,
+            bottom_margin=12,
+        )
         scrolled.set_child(self.text_view)
         content.append(scrolled)
 
         main_box.append(content)
         self.set_content(main_box)
 
-        # Start OCR server in background
-        threading.Thread(target=self._start_server, daemon=True).start()
+    # --------------------------------------------------------------------
+    # Status & State Management
+    # --------------------------------------------------------------------
+    def _set_status(self, title: str, revealed: bool = True, autohide: bool = False) -> None:
+        self.status_banner.set_title(title)
+        self.status_banner.set_revealed(revealed)
+        if autohide:
+            GLib.timeout_add_seconds(3, lambda: self.status_banner.set_revealed(False))
 
-    def _start_server(self):
-        success = self.server_manager.start()
-        if success:
-            GLib.idle_add(self._on_server_ready)
+    def _set_ui_busy(self, busy: bool) -> None:
+        self.capture_btn.set_sensitive(not busy)
+        if busy:
+            self.spinner.start()
         else:
-            GLib.idle_add(self._on_server_failed)
+            self.spinner.stop()
 
-    def _on_server_ready(self):
-        self.status_banner.set_title("✅ OCR engine ready")
-        GLib.timeout_add_seconds(2, lambda: self.status_banner.set_revealed(False))
+    # --------------------------------------------------------------------
+    # Server Handling
+    # --------------------------------------------------------------------
+    def _start_server(self) -> None:
+        success = self.server_manager.start()
+        GLib.idle_add(self._on_server_ready if success else self._on_server_failed)
+
+    def _on_server_ready(self) -> None:
+        self._set_status("✅ OCR engine ready", autohide=True)
         self.capture_btn.set_sensitive(True)
 
-    def _on_server_failed(self):
-        self.status_banner.set_title("❌ Failed to start OCR engine. Is Bun installed?")
+    def _on_server_failed(self) -> None:
+        self._set_status("❌ Failed to start OCR engine. Is Bun installed?")
 
-    def on_capture_clicked(self, btn):
-        self.capture_btn.set_sensitive(False)
-        self.spinner.start()
-
-        # Minimize window so it doesn't appear in screenshot
-        # self.minimize()
-
+    # --------------------------------------------------------------------
+    # Screenshot & OCR Flow
+    # --------------------------------------------------------------------
+    def on_capture_clicked(self, btn: Gtk.Button) -> None:
+        self._set_ui_busy(True)
         # Small delay to let window minimize, then trigger screenshot
-        GLib.timeout_add(400, self._trigger_screenshot)
+        GLib.timeout_add(250, self._trigger_screenshot)
 
-    def _trigger_screenshot(self):
+    def _trigger_screenshot(self) -> bool:
         self.screenshot_service.capture(self._on_screenshot_done)
-        return False
+        return False  # Do not repeat
 
-    def _on_screenshot_done(self, filepath, error):
+    def _on_screenshot_done(self, filepath: Optional[str], error: Optional[str]) -> None:
+        self.present()  # Bring window back to front
+
         if error or not filepath:
-            self.spinner.stop()
-            self.capture_btn.set_sensitive(True)
-            self.status_banner.set_title(f"⚠️ {error or 'No image captured'}")
-            self.status_banner.set_revealed(True)
-            self.present()
+            self._set_status(f"⚠️ {error or 'No image captured'}")
+            self._set_ui_busy(False)
             return
 
-        self.status_banner.set_title("🔍 Recognizing text...")
-        self.status_banner.set_revealed(True)
-        self.present()
+        self._set_status("🔍 Recognizing text...")
+        threading.Thread(target=self._do_ocr, args=(filepath,), daemon=True).start()
 
-        def do_ocr():
+    def _do_ocr(self, filepath: str) -> None:
+        try:
+            result = self.server_manager.send_image(filepath)
+            GLib.idle_add(self._on_ocr_done, result)
+        except Exception as e:
+            GLib.idle_add(self._on_ocr_error, f"An unexpected error occurred: {e}")
+        finally:
             try:
-                result = self.server_manager.send_image(filepath)
-                GLib.idle_add(self._on_ocr_done, result)
-            except Exception as e:
-                GLib.idle_add(self._on_ocr_error, str(e))
-            finally:
-                # Clean up screenshot temp file
-                try:
-                    os.unlink(filepath)
-                except Exception:
-                    pass
+                os.unlink(filepath)
+            except OSError as e:
+                print(f"Warning: Failed to delete temp screenshot: {e}")
 
-        threading.Thread(target=do_ocr, daemon=True).start()
-
-    def _on_ocr_done(self, result):
-        self.spinner.stop()
-        self.capture_btn.set_sensitive(True)
+    def _on_ocr_done(self, result: Dict) -> None:
+        self._set_ui_busy(False)
 
         if result.get("status") == "success":
-            text = result.get("text", "")
-            if text.strip():
+            text = result.get("text", "").strip()
+            if text:
                 self.text_view.get_buffer().set_text(text)
                 self.copy_btn.set_sensitive(True)
-                self.status_banner.set_title("✅ Text recognized!")
-                self.status_banner.set_revealed(True)
-                GLib.timeout_add_seconds(2, lambda: self.status_banner.set_revealed(False))
+                self._set_status("✅ Text recognized!", autohide=True)
             else:
                 self.text_view.get_buffer().set_text("")
                 self.copy_btn.set_sensitive(False)
-                self.status_banner.set_title("⚠️ No text found in the selected region")
-                self.status_banner.set_revealed(True)
+                self._set_status("⚠️ No text found in the selected region.")
         else:
-            self._on_ocr_error(result.get("message", "Unknown error"))
+            self._on_ocr_error(result.get("message", "Unknown OCR error"))
 
-    def _on_ocr_error(self, error_msg):
-        self.spinner.stop()
-        self.capture_btn.set_sensitive(True)
-        self.status_banner.set_title(f"❌ OCR Error: {error_msg}")
-        self.status_banner.set_revealed(True)
+    def _on_ocr_error(self, error_msg: str) -> None:
+        self._set_ui_busy(False)
+        self._set_status(f"❌ OCR Error: {error_msg}")
 
-    def on_copy_clicked(self, btn):
+    # --------------------------------------------------------------------
+    # Event Handlers
+    # --------------------------------------------------------------------
+    def on_copy_clicked(self, btn: Gtk.Button) -> None:
         buffer = self.text_view.get_buffer()
-        start, end = buffer.get_bounds()
-        text = buffer.get_text(start, end, False)
+        text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), False)
         if text.strip():
-            clipboard = Gdk.Display.get_default().get_clipboard()
-            clipboard.set(text)
-            self.status_banner.set_title("📋 Copied to clipboard!")
-            self.status_banner.set_revealed(True)
-            GLib.timeout_add_seconds(2, lambda: self.status_banner.set_revealed(False))
+            Gdk.Display.get_default().get_clipboard().set(text)
+            self._set_status("📋 Copied to clipboard!", autohide=True)
 
 
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
 class OcrApp(Adw.Application):
-    def __init__(self):
-        super().__init__(application_id="com.github.ocrapp")
+    """Main GTK application for gnome-paddle."""
+
+    def __init__(self, application_id: str):
+        super().__init__(application_id=application_id)
         self.server_manager = OcrServerManager()
 
-    def do_activate(self):
+    def do_activate(self) -> None:
+        """Called when the application is activated."""
         win = self.props.active_window
         if not win:
             win = OcrWindow(self, self.server_manager)
         win.present()
 
-    def do_shutdown(self):
+    def do_shutdown(self) -> None:
+        """Called when the application is shutting down."""
         self.server_manager.stop()
         Adw.Application.do_shutdown(self)
 
@@ -351,11 +359,20 @@ class OcrApp(Adw.Application):
 # ---------------------------------------------------------------------------
 # Entry Point
 # ---------------------------------------------------------------------------
-def main():
-    app = OcrApp()
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
-    app.run(sys.argv)
+APP_ID = "com.github.esta.gnome-paddle"
+
+def handle_sigint(sig, frame):
+    """SIGINT handler to ensure clean shutdown."""
+    app = Gio.Application.get_default()
+    if app:
+        app.quit()
+
+def main() -> int:
+    """Application entry point."""
+    app = OcrApp(application_id=APP_ID)
+    signal.signal(signal.SIGINT, handle_sigint)
+    return app.run(sys.argv)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
