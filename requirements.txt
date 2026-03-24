@@ -2,6 +2,5 @@ PyGObject
 dbus-python
 
 # OCR library dependency
-# Replace this editable local dependency with your GitHub URL when published:
-# git+https://github.com/<your-org>/ppu-paddle-ocr-py.git@v0.1.0
--e ../paddle-py
+# Pinned to release tag for reproducible installs
+git+https://github.com/estaesta/ppu-paddle-ocr-py.git@v0.1.0
