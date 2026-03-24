@@ -3,14 +3,15 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Xdp", "1.0")
 
-import subprocess
 import threading
 import time
 import sys
 import os
 import signal
-import requests
-from typing import Optional, List, Dict, Callable
+from typing import Optional, List, Dict, Callable, Any
+
+# Local ONNX OCR wrapper
+from paddle_py.ocr_server import PaddleOnnxOCR
 
 from gi.repository import Gtk, Adw, Gdk, Gio, GLib, Xdp
 
@@ -18,100 +19,92 @@ from gi.repository import Gtk, Adw, Gdk, Gio, GLib, Xdp
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-OCR_SERVER_URL = "http://localhost:18765"
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 # ---------------------------------------------------------------------------
-# OCR Server Manager
+# OCR Server Manager (in-process ONNX OCR)
 # ---------------------------------------------------------------------------
 class OcrServerManager:
-    """Manages the lifecycle of the Bun OCR server."""
+    """Manages an in-process Paddle ONNX OCR instance.
+
+    This replaces the previous Bun/TypeScript server approach. The manager
+    initializes a PaddleOnnxOCR instance and exposes send_image() which returns
+    the same JSON-like dict structure the UI expects.
+    """
 
     def __init__(self) -> None:
-        self.process: Optional[subprocess.Popen] = None
+        # Read debug/config from environment
+        debug_env = os.environ.get("OCR_DEBUG", "0").lower()
+        debug_flag = debug_env in ("1", "true", "yes")
+        beam_env = os.environ.get("OCR_BEAM", "0").lower()
+        beam_flag = beam_env in ("1", "true", "yes")
+        beam_width = int(os.environ.get("OCR_BEAM_WIDTH", "5"))
 
-    def _get_server_command(self) -> List[str]:
-        compiled_bin = os.environ.get("OCR_SERVER_BIN")
-        if compiled_bin and os.path.isfile(compiled_bin):
-            return [compiled_bin]
-        else:
-            return ["bun", "run", os.path.join(APP_DIR, "ocr_server.ts")]
+        # Default model URLs (hard-coded to the PP-OCRv5 mobile models and ppocrv5_dict)
+        DEFAULT_DET_URL = "https://media.githubusercontent.com/media/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/detection/PP-OCRv5_mobile_det_infer.onnx"
+        DEFAULT_REC_URL = "https://media.githubusercontent.com/media/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/recognition/PP-OCRv5_mobile_rec_infer.onnx"
+        DEFAULT_DICT_URL = "https://raw.githubusercontent.com/PT-Perkasa-Pilar-Utama/ppu-paddle-ocr-models/main/recognition/ppocrv5_dict.txt"
+
+        # Use environment overrides if present, otherwise use hard-coded defaults
+        det_url = os.environ.get('OCR_DET_URL', DEFAULT_DET_URL)
+        rec_url = os.environ.get('OCR_REC_URL', DEFAULT_REC_URL)
+        dict_url = os.environ.get('OCR_DICT_URL', DEFAULT_DICT_URL)
+
+        # Pass URLs to the OCR wrapper; it will download into ~/.cache/ppu-paddle-ocr if missing
+        self.ocr: Optional[PaddleOnnxOCR] = PaddleOnnxOCR(
+            det_model_path=det_url,
+            rec_model_path=rec_url,
+            dict_path=dict_url,
+            debug=debug_flag,
+            use_beam_search=beam_flag,
+            beam_width=beam_width,
+        )
+        self.initialized: bool = False
 
     def start(self) -> bool:
-        if self.is_running():
+        if self.initialized:
             return True
-
-        cmd = self._get_server_command()
         try:
-            self.process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                cwd=APP_DIR,
-            )
-            # Wait for server to be ready
-            for _ in range(120):  # 2-minute timeout
-                time.sleep(1)
-                if not self.is_running():
-                    break  # Process died
-                try:
-                    resp = requests.get(f"{OCR_SERVER_URL}/health", timeout=1)
-                    resp.raise_for_status()
-                    if resp.json().get("status") == "ok":
-                        print("✅ OCR server started successfully.")
-                        return True
-                except requests.RequestException:
-                    continue  # Retry until timeout
-            print("❌ Timed out waiting for OCR server to start.")
-            return False
-        except FileNotFoundError:
-            print(f"❌ Command not found: '{cmd[0]}'. Is Bun installed and in your PATH?")
-            return False
+            self.ocr.initialize()
+            self.initialized = True
+            print("✅ OCR engine initialized.")
+            return True
         except Exception as e:
-            print(f"❌ Failed to start OCR server: {e}")
+            print(f"❌ Failed to initialize OCR engine: {e}")
             return False
 
     def is_running(self) -> bool:
-        return self.process is not None and self.process.poll() is None
+        return self.initialized
 
     def stop(self) -> None:
-        if self.process and self.is_running():
-            print("Stopping OCR server...")
+        if self.initialized and self.ocr:
             try:
-                requests.post(f"{OCR_SERVER_URL}/shutdown", timeout=2)
-            except requests.RequestException:
-                pass  # Server might already be down
-            try:
-                self.process.terminate()
-                self.process.wait(timeout=5)
+                self.ocr.destroy()
             except Exception as e:
-                self.process.kill()
-                print(f"Forced to kill OCR server: {e}")
-            print("✅ OCR server stopped.")
+                print(f"Error destroying OCR engine: {e}")
+            self.initialized = False
+            print("✅ OCR engine stopped.")
 
-    def send_image(self, image_path: str) -> Dict:
+    def send_image(self, image_path: str) -> Dict[str, Any]:
         try:
             with open(image_path, "rb") as f:
                 image_data = f.read()
 
-            response = requests.post(
-                f"{OCR_SERVER_URL}/ocr",
-                data=image_data,
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=30,
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.RequestException as e:
+            # recognize directly using the ONNX wrapper
+            result = self.ocr.recognize(image_data)
+
             return {
-                "status": "error",
-                "message": f"Network error: {e}",
+                "status": "success",
+                "text": result.get("text", ""),
+                "lines": result.get("lines", []),
             }
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
 
 # ---------------------------------------------------------------------------
-# Screenshot Service (same approach as Frog)
+# Screenshot Service
 # ---------------------------------------------------------------------------
 class ScreenshotService:
     """
@@ -178,7 +171,7 @@ class OcrWindow(Adw.ApplicationWindow):
 
         self._init_ui()
 
-        # Start OCR server in background
+        # Start OCR engine in background
         threading.Thread(target=self._start_server, daemon=True).start()
 
     # --------------------------------------------------------------------
@@ -265,7 +258,7 @@ class OcrWindow(Adw.ApplicationWindow):
         self.capture_btn.set_sensitive(True)
 
     def _on_server_failed(self) -> None:
-        self._set_status("❌ Failed to start OCR engine. Is Bun installed?")
+        self._set_status("❌ Failed to start OCR engine. Is onnxruntime and models installed?")
 
     # --------------------------------------------------------------------
     # Screenshot & OCR Flow
