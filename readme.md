@@ -2,7 +2,7 @@
 
 A lightweight GNOME screenshot OCR app using an in-process Python ONNX OCR engine.
 
-This branch removes Bun/server dependencies and uses the Python library directly.
+This branch uses the Python OCR library directly in-process.
 
 ## Credits
 
