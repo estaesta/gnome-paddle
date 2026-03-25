@@ -3,4 +3,4 @@ dbus-python
 
 # OCR library dependency
 # Pinned to release tag for reproducible installs
-git+https://github.com/estaesta/paddle-ocr-onnx-py.git@v0.1.1
+git+https://github.com/estaesta/paddle-ocr-onnx-py.git@v0.1.2

@@ -59,8 +59,14 @@ class OcrServerManager:
             debug=debug_flag,
             use_beam_search=beam_flag,
             beam_width=beam_width,
+            enable_vertical=True,
         )
         self.initialized: bool = False
+
+        self.padding_v = float(os.environ.get("OCR_PADDING_V", "0.4"))
+        self.padding_h = float(os.environ.get("OCR_PADDING_H", "0.6"))
+        self.enable_vertical = os.environ.get("OCR_VERTICAL", "1").lower() in ("1", "true", "yes")
+        self._settings_lock = threading.Lock()
 
     def start(self) -> bool:
         if self.initialized:
@@ -68,6 +74,7 @@ class OcrServerManager:
         try:
             self.ocr.initialize()
             self.initialized = True
+            self.apply_settings(self.padding_v, self.padding_h, self.enable_vertical)
             print("✅ OCR engine initialized.")
             return True
         except Exception as e:
@@ -76,6 +83,23 @@ class OcrServerManager:
 
     def is_running(self) -> bool:
         return self.initialized
+
+    def apply_settings(self, padding_v: float, padding_h: float, enable_vertical: bool) -> None:
+        with self._settings_lock:
+            self.padding_v = padding_v
+            self.padding_h = padding_h
+            self.enable_vertical = enable_vertical
+            if self.ocr:
+                self.ocr.padding_v = padding_v
+                self.ocr.padding_h = padding_h
+                self.ocr.enable_vertical = enable_vertical
+
+    def get_settings(self) -> Dict[str, float | bool]:
+        return {
+            "padding_v": self.padding_v,
+            "padding_h": self.padding_h,
+            "enable_vertical": self.enable_vertical,
+        }
 
     def stop(self) -> None:
         if self.initialized and self.ocr:
@@ -186,6 +210,11 @@ class OcrWindow(Adw.ApplicationWindow):
         self.copy_btn.set_sensitive(False)
         header.pack_end(self.copy_btn)
 
+        self.settings_btn = Gtk.MenuButton(icon_name="emblem-system-symbolic")
+        self.settings_btn.set_tooltip_text("Settings")
+        self.settings_btn.set_popover(self._build_settings_popover())
+        header.pack_end(self.settings_btn)
+
         main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         main_box.append(header)
 
@@ -229,6 +258,67 @@ class OcrWindow(Adw.ApplicationWindow):
 
         main_box.append(content)
         self.set_content(main_box)
+
+    # --------------------------------------------------------------------
+    # Settings UI
+    # --------------------------------------------------------------------
+    def _build_settings_popover(self) -> Gtk.Popover:
+        settings = self.server_manager.get_settings()
+
+        popover = Gtk.Popover()
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=8,
+            margin_start=12,
+            margin_end=12,
+            margin_top=12,
+            margin_bottom=12,
+        )
+
+        # Vertical padding
+        box.append(Gtk.Label(label="Vertical padding", xalign=0))
+        adj_v = Gtk.Adjustment(
+            value=settings["padding_v"],
+            lower=0.1,
+            upper=0.6,
+            step_increment=0.05,
+            page_increment=0.1,
+            page_size=0,
+        )
+        self.padding_v_spin = Gtk.SpinButton(adjustment=adj_v, digits=2)
+        self.padding_v_spin.connect("value-changed", self._on_settings_changed)
+        box.append(self.padding_v_spin)
+
+        # Horizontal padding
+        box.append(Gtk.Label(label="Horizontal padding", xalign=0))
+        adj_h = Gtk.Adjustment(
+            value=settings["padding_h"],
+            lower=0.1,
+            upper=0.9,
+            step_increment=0.05,
+            page_increment=0.1,
+            page_size=0,
+        )
+        self.padding_h_spin = Gtk.SpinButton(adjustment=adj_h, digits=2)
+        self.padding_h_spin.connect("value-changed", self._on_settings_changed)
+        box.append(self.padding_h_spin)
+
+        # Vertical text toggle
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        row.append(Gtk.Label(label="Vertical text", xalign=0))
+        self.vertical_switch = Gtk.Switch(active=bool(settings["enable_vertical"]))
+        self.vertical_switch.connect("notify::active", self._on_settings_changed)
+        row.append(self.vertical_switch)
+        box.append(row)
+
+        popover.set_child(box)
+        return popover
+
+    def _on_settings_changed(self, *args) -> None:
+        padding_v = float(self.padding_v_spin.get_value())
+        padding_h = float(self.padding_h_spin.get_value())
+        enable_vertical = bool(self.vertical_switch.get_active())
+        self.server_manager.apply_settings(padding_v, padding_h, enable_vertical)
 
     # --------------------------------------------------------------------
     # Status & State Management
